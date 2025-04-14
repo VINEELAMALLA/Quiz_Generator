@@ -1,8 +1,3 @@
-import asyncio
-# Patch for Streamlit + Torch compatibility on Python 3.12+
-if not asyncio.get_event_loop().is_running():
-    asyncio.set_event_loop(asyncio.new_event_loop())
-
 import streamlit as st
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 import torch
