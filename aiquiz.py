@@ -1,62 +1,69 @@
+import asyncio
+# Patch for Streamlit + Torch compatibility on Python 3.12+
+if not asyncio.get_event_loop().is_running():
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
 import streamlit as st
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 import torch
 import re
 from sentence_transformers import SentenceTransformer, util
 import base64
-import os
 
-# Ensure Streamlit page config is set first
-st.set_page_config(page_title="AI Quiz Generator", page_icon="🚀")
+# Set Streamlit page config
+st.set_page_config(page_title="AI Quiz Generator", page_icon="🧠")
 
-# Initialize session state
-if 'form_created' not in st.session_state:
-    st.session_state.form_created = False
-if 'form_html' not in st.session_state:
-    st.session_state.form_html = ""
+# Session state initialization
 if 'questions' not in st.session_state:
     st.session_state.questions = []
+if 'form_html' not in st.session_state:
+    st.session_state.form_html = ""
+if 'form_created' not in st.session_state:
+    st.session_state.form_created = False
 
-# Note: Ensure compatible versions: torch>=2.1.0, transformers>=4.40.0, sentence-transformers>=2.2.0
-# Install or update with: pip install torch>=2.1.0 transformers>=4.40.0 sentence-transformers>=2.2.0
-
-# Load models with explicit device
+# Force GPU usage if available
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if device.type == "cuda":
+    torch.cuda.empty_cache()
+
+# Load quiz generation model
 try:
     tokenizer = AutoTokenizer.from_pretrained("iarfmoose/t5-base-question-generator")
     model = AutoModelForSeq2SeqLM.from_pretrained(
-        "iarfmoose/t5-base-question-generator",
-        device_map="auto" if torch.cuda.is_available() else None,
-        torch_dtype=torch.float32
-    )
-    model.to(device)  # Ensure model is on the correct device
+        "iarfmoose/t5-base-question-generator"
+    ).to(device)
+    model.eval()
 except Exception as e:
-    st.error(f"Failed to load model: {str(e)}. Ensure compatible PyTorch and Transformers versions.")
+    st.error(f"Model loading failed: {e}")
     st.stop()
 
-similarity_model = SentenceTransformer("all-MiniLM-L6-v2")
+# Load semantic similarity model
+try:
+    similarity_model = SentenceTransformer("all-MiniLM-L6-v2", device=device)
+except Exception as e:
+    st.error(f"SentenceTransformer loading failed: {e}")
+    st.stop()
 
-# Updated generate_questions function with sampling
+# Generate questions
 def generate_questions(context, num_questions=5):
     prompt = "generate questions: " + context.strip().replace("\n", " ")
     inputs = tokenizer.encode(prompt, return_tensors="pt", truncation=True, max_length=512).to(device)
 
-    num_return = num_questions * 3  # Increased to *3 for more candidates
-    outputs = model.generate(
-        inputs,
-        max_length=64,
-        do_sample=True,
-        top_p=0.95,
-        temperature=0.7,
-        num_return_sequences=num_return,
-        no_repeat_ngram_size=2,
-        early_stopping=False,  # Disabled to avoid warning
-    )
+    with torch.no_grad():
+        outputs = model.generate(
+            inputs,
+            max_length=64,
+            do_sample=True,
+            top_p=0.95,
+            temperature=0.7,
+            num_return_sequences=num_questions * 3,
+            no_repeat_ngram_size=2,
+        )
 
     decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-    cleaned = clean_questions(decoded, num_questions)
-    return cleaned
+    return clean_questions(decoded, num_questions)
 
+# Clean generated questions
 def clean_questions(raw_questions, max_questions):
     cleaned = []
     seen = set()
@@ -67,108 +74,94 @@ def clean_questions(raw_questions, max_questions):
         q_lower = q.lower()
 
         if (
-            len(q) > 15  # Reduced from 20 to allow shorter questions
+            len(q) > 15
             and not re.search(r"\b(name|someone|he|she|him|her|Mr|Ms|Mrs|Dr|Prof)\b", q_lower)
             and q_lower not in seen
         ):
             seen.add(q_lower)
             cleaned.append(q)
 
-    # Semantic deduplication with adjusted threshold
+    # Semantic deduplication
     unique = []
     if cleaned:
-        embeddings = similarity_model.encode(cleaned, convert_to_tensor=True)
+        embeddings = similarity_model.encode(cleaned, convert_to_tensor=True, device=device)
         for i, q in enumerate(cleaned):
-            if len(unique) == 0:
+            if not unique:
                 unique.append(q)
             else:
                 sim_scores = util.cos_sim(embeddings[i], embeddings[[cleaned.index(u) for u in unique]])
-                if max(sim_scores[0]) < 0.9:  # Changed to 0.9 for less strict deduplication
+                if max(sim_scores[0]) < 0.9:
                     unique.append(q)
             if len(unique) >= max_questions:
                 break
     return unique
 
-# Function to create downloadable file
+# Download link helper
 def get_binary_file_downloader_html(bin_file, file_label='File'):
-    if os.path.exists(bin_file):
+    try:
         with open(bin_file, 'rb') as f:
             data = f.read()
         bin_str = base64.b64encode(data).decode()
         href = f'<a href="data:application/octet-stream;base64,{bin_str}" download="{file_label}.html">Download {file_label}</a>'
         return href
-    return "Error: File not found."
+    except Exception:
+        return "Error: File not found."
 
-# ------------------ Streamlit App ------------------
-
+# ---------------- UI ----------------
 st.title("📚 AI Quiz Generator")
+st.markdown("Paste your study notes or content below to generate quiz questions.")
 
-st.markdown("Enter your study content or context below, and this app will generate meaningful quiz points.")
-
-context = st.text_area("Enter context or study material here:", height=200)
-num_questions = st.slider("Select number of quiz questions to generate:", 1, 20, 5)
-form_owner_email = st.text_input("Enter your email to receive form responses:", "")
+context = st.text_area("Enter study content here:", height=200)
+num_questions = st.slider("Number of quiz questions:", 1, 20, 5)
+form_owner_email = st.text_input("Enter your email for form responses:", "")
 
 if st.button("Generate Quiz"):
     if not context.strip():
-        st.warning("Please enter some content to generate questions.")
+        st.warning("Please enter study content.")
     elif not form_owner_email:
-        st.warning("Please enter your email to receive form responses.")
+        st.warning("Please enter your email.")
     else:
         with st.spinner("Generating questions..."):
             try:
                 questions = generate_questions(context, num_questions)
                 if questions:
                     st.session_state.questions = questions
-                    st.success("✨ Here are your quiz questions:")
+                    st.success("✅ Generated Questions:")
                     for i, q in enumerate(questions, 1):
                         st.markdown(f"**{i}. {q}**")
-
-                    # Ask if questions are okay
-                    if st.button("Are these questions okay?"):
-                        if st.button("Yes"):
-                            # Ask if user wants to create a form
-                            if st.button("Can I create a form?"):
-                                # Create Formspree-compatible HTML form
-                                formspree_endpoint = f"https://formspree.io/f/{form_owner_email}"  # Placeholder; replace with actual Formspree URL
-                                form_html = f"""
-                                <html>
-                                <head><title>Quiz Form</title></head>
-                                <body>
-                                <h1>Quiz Form</h1>
-                                <form action="{formspree_endpoint}" method="POST">
-                                {''.join([f'<div><label>{i}. {q}</label><input type="text" name="q{i}" required></div>' for i, q in enumerate(st.session_state.questions, 1)])}
-                                <input type="hidden" name="total_questions" value="{len(st.session_state.questions)}">
-                                <input type="hidden" name="points_per_question" value="1">
-                                <input type="submit" value="Submit">
-                                </form>
-                                <p>Download this file, replace the Formspree endpoint with your unique URL from <a href="https://formspree.io">Formspree</a>, and share it. Responses will be emailed to {form_owner_email}.</p>
-                                </body>
-                                </html>
-                                """
-                                st.markdown("### Form Created!")
-                                st.markdown("### Form HTML Preview:")
-                                st.code(form_html, language="html")
-                                st.success(f"Each question is worth 1 point. Total points possible: {len(st.session_state.questions)}")
-                                st.markdown("**Note:** Sign up at Formspree to get your unique endpoint and replace the placeholder URL.")
-
-                                # Save form to a temporary file and set session state
-                                with open("quiz_form.html", "w") as f:
-                                    f.write(form_html)
-                                st.session_state.form_html = form_html
-                                st.session_state.form_created = True
                 else:
-                    st.warning("Couldn't generate valid questions. Try a different input.")
+                    st.warning("No valid questions generated. Try different input.")
             except Exception as e:
-                st.error(f"An error occurred: {str(e)}")
+                st.error(f"Error: {str(e)}")
 
-# Display Download Form button if form is created
-if st.session_state.form_created:
-    st.write("Form is ready for download!")
-    if st.button("Download Form"):
+# Question approval and form creation
+if st.session_state.questions:
+    st.markdown("### Approve Questions")
+    if st.button("Questions Look Good?"):
+        form_html = f"""
+        <html>
+        <head><title>Quiz Form</title></head>
+        <body>
+        <h1>Quiz Form</h1>
+        <form action="{form_owner_email}" method="POST">
+        {''.join([f'<div><label>{i}. {q}</label><input type="text" name="q{i}" required></div>' for i, q in enumerate(st.session_state.questions, 1)])}
+        <input type="hidden" name="total_questions" value="{len(st.session_state.questions)}">
+        <input type="hidden" name="points_per_question" value="1">
+        <input type="submit" value="Submit">
+        </form>
+        <p>Replace the form action with your actual Formspree endpoint from <a href='https://formspree.io/'>Formspree.io</a>.</p>
+        </body>
+        </html>
+        """
+        st.session_state.form_html = form_html
+        st.session_state.form_created = True
         with open("quiz_form.html", "w") as f:
-            f.write(st.session_state.form_html)
-        st.markdown(get_binary_file_downloader_html("quiz_form.html", "Quiz Form"), unsafe_allow_html=True)
-        st.markdown("Click the link above to download the form.")
+            f.write(form_html)
+        st.success("✅ Form Created!")
+
+# Form download
+if st.session_state.form_created:
+    st.markdown("### Download Quiz Form")
+    st.markdown(get_binary_file_downloader_html("quiz_form.html", "Quiz_Form"), unsafe_allow_html=True)
 else:
-    st.markdown("Generate, confirm questions, and create a form to enable the Download Form button.")
+    st.info("Generate and approve questions to create and download a form.")
