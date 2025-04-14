@@ -1,9 +1,9 @@
+streamlit==1.32.2
+torch==2.2.1
+transformers==4.39.3
+sentence-transformers==2.6.1
 numpy<2
-streamlit
-torch
-transformers
-sentencepiece
-sentence-transformers
-scikit-learn
-numpy
-Pillow
+scipy==1.13.0
+tokenizers==0.19.1
+protobuf==4.25.3
+scikit-learn==1.4.1.post1
